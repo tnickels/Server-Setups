@@ -51,6 +51,37 @@ fi
 echo ""
 
 # --------------------------------------------------
+# BACKUP CRON JOBS (before anything else)
+# --------------------------------------------------
+CRON_BACKUP_DIR="/root/cron-backup-$(date +%Y%m%d-%H%M%S)"
+log "Backing up all cron jobs to ${CRON_BACKUP_DIR}..."
+mkdir -p "${CRON_BACKUP_DIR}"
+
+# Back up /etc/cron.d/
+if [ -d /etc/cron.d ] && [ "$(ls -A /etc/cron.d/)" ]; then
+    cp -a /etc/cron.d/ "${CRON_BACKUP_DIR}/cron.d/"
+    log "  Backed up /etc/cron.d/ ($(ls /etc/cron.d/ | wc -l) files)"
+fi
+
+# Back up /etc/crontab
+if [ -f /etc/crontab ]; then
+    cp /etc/crontab "${CRON_BACKUP_DIR}/crontab"
+    log "  Backed up /etc/crontab"
+fi
+
+# Back up all user crontabs
+for user in $(cut -f1 -d: /etc/passwd); do
+    USERCRON=$(crontab -u "$user" -l 2>/dev/null) || true
+    if [ -n "$USERCRON" ]; then
+        echo "$USERCRON" > "${CRON_BACKUP_DIR}/crontab-${user}"
+        log "  Backed up crontab for user: ${user}"
+    fi
+done
+
+log "Cron backup complete: ${CRON_BACKUP_DIR}"
+echo ""
+
+# --------------------------------------------------
 # 0. HOSTNAME / COMPUTER NAME
 # --------------------------------------------------
 CURRENT_HOSTNAME=$(hostname)
@@ -105,6 +136,43 @@ else
     apt update -y && apt upgrade -y
     apt autoremove -y
     apt autoclean -y
+fi
+
+# --------------------------------------------------
+# VERIFY CRON JOBS AFTER APT OPERATIONS
+# --------------------------------------------------
+CRON_OK=true
+
+# Check /etc/cron.d/ files still exist
+if [ -d "${CRON_BACKUP_DIR}/cron.d" ]; then
+    for cronfile in "${CRON_BACKUP_DIR}/cron.d/"*; do
+        filename=$(basename "$cronfile")
+        if [ ! -f "/etc/cron.d/${filename}" ]; then
+            err "Cron file /etc/cron.d/${filename} was removed during apt operations!"
+            cp "$cronfile" "/etc/cron.d/${filename}"
+            log "  Restored /etc/cron.d/${filename} from backup"
+            CRON_OK=false
+        fi
+    done
+fi
+
+# Check user crontabs still intact
+for cronbackup in "${CRON_BACKUP_DIR}"/crontab-*; do
+    [ -f "$cronbackup" ] || continue
+    username=$(basename "$cronbackup" | sed 's/crontab-//')
+    CURRENT_CRON=$(crontab -u "$username" -l 2>/dev/null) || true
+    if [ -z "$CURRENT_CRON" ]; then
+        err "Crontab for user ${username} was removed during apt operations!"
+        crontab -u "$username" "$cronbackup"
+        log "  Restored crontab for user: ${username}"
+        CRON_OK=false
+    fi
+done
+
+if [ "$CRON_OK" = true ]; then
+    log "Cron jobs verified — all intact after apt operations."
+else
+    warn "Some cron jobs were restored from backup. Check ${CRON_BACKUP_DIR} for details."
 fi
 
 # --------------------------------------------------
@@ -258,8 +326,6 @@ systemctl restart systemd-journald
 # --------------------------------------------------
 # 8. AUTOMATIC SECURITY UPDATES (optional)
 # --------------------------------------------------
-# Skipped for HestiaCP/Coolify — auto-updates can break
-# panel-managed packages and dependencies
 if [ "$HESTIA_RUNNING" = true ] || [ "$COOLIFY_RUNNING" = true ]; then
     warn "Skipping unattended-upgrades (can break panel-managed packages)."
     info "Manage updates manually or through your panel instead."
@@ -340,7 +406,7 @@ else
     sed -i 's/^#\?ClientAliveCountMax.*/ClientAliveCountMax 3/' /etc/ssh/sshd_config
 
     # Ubuntu 24.04 uses ssh.service, older versions use sshd.service
-    if systemctl list-units --type=service | grep -q 'ssh.service'; then
+    if systemctl list-units --type=service | grep -q ' ssh.service'; then
         systemctl restart ssh
     elif systemctl list-units --type=service | grep -q 'sshd.service'; then
         systemctl restart sshd
@@ -408,6 +474,43 @@ chmod +x /etc/profile.d/custom-prompt.sh
 eval "${PROMPT_LINE}"
 
 # --------------------------------------------------
+# FINAL CRON VERIFICATION
+# --------------------------------------------------
+echo ""
+log "Running final cron job verification..."
+FINAL_CRON_OK=true
+
+if [ -d "${CRON_BACKUP_DIR}/cron.d" ]; then
+    for cronfile in "${CRON_BACKUP_DIR}/cron.d/"*; do
+        filename=$(basename "$cronfile")
+        if [ ! -f "/etc/cron.d/${filename}" ]; then
+            err "Cron file /etc/cron.d/${filename} missing!"
+            cp "$cronfile" "/etc/cron.d/${filename}"
+            log "  Restored /etc/cron.d/${filename}"
+            FINAL_CRON_OK=false
+        fi
+    done
+fi
+
+for cronbackup in "${CRON_BACKUP_DIR}"/crontab-*; do
+    [ -f "$cronbackup" ] || continue
+    username=$(basename "$cronbackup" | sed 's/crontab-//')
+    CURRENT_CRON=$(crontab -u "$username" -l 2>/dev/null) || true
+    if [ -z "$CURRENT_CRON" ]; then
+        err "Crontab for user ${username} missing!"
+        crontab -u "$username" "$cronbackup"
+        log "  Restored crontab for user: ${username}"
+        FINAL_CRON_OK=false
+    fi
+done
+
+if [ "$FINAL_CRON_OK" = true ]; then
+    log "Final cron verification passed — all jobs intact."
+else
+    warn "Some cron jobs were restored. Backup saved at: ${CRON_BACKUP_DIR}"
+fi
+
+# --------------------------------------------------
 # SUMMARY
 # --------------------------------------------------
 echo ""
@@ -422,6 +525,7 @@ echo "  Swap:           $(swapon --show --noheadings | awk '{print $3}' | head -
 echo "  Swappiness:     $(cat /proc/sys/vm/swappiness)"
 echo "  Cache Pressure: $(cat /proc/sys/vm/vfs_cache_pressure)"
 echo "  File Desc:      $(grep -E '^\*\s+hard\s+nofile' /etc/security/limits.conf | awk '{print $4}' | tail -1)"
+echo "  Cron Backup:    ${CRON_BACKUP_DIR}"
 if [ "$HESTIA_RUNNING" = true ]; then
 echo "  HestiaCP:       detected (using its own firewall, fail2ban, SSH config)"
 fi
