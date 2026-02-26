@@ -61,8 +61,21 @@ if echo "${CURRENT_HOSTNAME}" | grep -qiE '^(localhost|ubuntu|vps|server|ip-|ec2
     SUGGESTED_HOSTNAME="node-server"
 fi
 
-read -p "Enter computer name [${SUGGESTED_HOSTNAME}]: " NEW_HOSTNAME
-NEW_HOSTNAME=${NEW_HOSTNAME:-${SUGGESTED_HOSTNAME}}
+if [ "$HESTIA_RUNNING" = true ]; then
+    warn "HestiaCP uses the hostname for panel access and SSL certificates."
+    warn "Changing it can break your panel if you don't update Hestia's config afterwards."
+    info "Current hostname: ${CURRENT_HOSTNAME}"
+    if ask_yn "Change hostname anyway?"; then
+        read -p "Enter computer name [${SUGGESTED_HOSTNAME}]: " NEW_HOSTNAME
+        NEW_HOSTNAME=${NEW_HOSTNAME:-${SUGGESTED_HOSTNAME}}
+    else
+        NEW_HOSTNAME=${CURRENT_HOSTNAME}
+        log "Keeping hostname: ${CURRENT_HOSTNAME}"
+    fi
+else
+    read -p "Enter computer name [${SUGGESTED_HOSTNAME}]: " NEW_HOSTNAME
+    NEW_HOSTNAME=${NEW_HOSTNAME:-${SUGGESTED_HOSTNAME}}
+fi
 
 # Sanitise hostname (lowercase, alphanumeric and hyphens only)
 NEW_HOSTNAME=$(echo "${NEW_HOSTNAME}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/^-//;s/-$//')
@@ -84,10 +97,15 @@ fi
 # --------------------------------------------------
 # 1. SYSTEM UPDATE & UPGRADE
 # --------------------------------------------------
-log "Updating and upgrading system packages..."
-apt update -y && apt upgrade -y
-apt autoremove -y
-apt autoclean -y
+if [ "$HESTIA_RUNNING" = true ] || [ "$COOLIFY_RUNNING" = true ]; then
+    log "Updating package lists (skipping upgrade to protect panel-managed packages)..."
+    apt update -y
+else
+    log "Updating and upgrading system packages..."
+    apt update -y && apt upgrade -y
+    apt autoremove -y
+    apt autoclean -y
+fi
 
 # --------------------------------------------------
 # 2. TIMEZONE
@@ -360,7 +378,10 @@ fi
 # 13. CUSTOM SHELL PROMPT
 # --------------------------------------------------
 log "Setting up custom shell prompt..."
-HOSTNAME_UPPER=$(echo "${NEW_HOSTNAME}" | tr '[:lower:]' '[:upper:]')
+PROMPT_DEFAULT=$(echo "${NEW_HOSTNAME}" | tr '[:lower:]' '[:upper:]')
+read -p "Enter display name for prompt [${PROMPT_DEFAULT}]: " PROMPT_NAME
+PROMPT_NAME=${PROMPT_NAME:-${PROMPT_DEFAULT}}
+HOSTNAME_UPPER=$(echo "${PROMPT_NAME}" | tr '[:lower:]' '[:upper:]')
 
 # Prompt format: user@COMPUTERNAME: /current/path %
 PROMPT_LINE="PS1='\u@${HOSTNAME_UPPER}: \w % '"
