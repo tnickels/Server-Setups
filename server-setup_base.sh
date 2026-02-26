@@ -114,13 +114,11 @@ if [ "$CURRENT_SWAP_BYTES" -gt 0 ] 2>/dev/null; then
         if ask_yn "Change swap to ${RECOMMENDED_SWAP}?"; then
             log "Reconfiguring swap to ${RECOMMENDED_SWAP}..."
             swapoff -a
-            # Remove existing swapfile if present
             [ -f /swapfile ] && rm /swapfile
             fallocate -l ${RECOMMENDED_SWAP} /swapfile
             chmod 600 /swapfile
             mkswap /swapfile
             swapon /swapfile
-            # Ensure fstab entry
             sed -i '/\/swapfile/d' /etc/fstab
             echo '/swapfile none swap sw 0 0' >> /etc/fstab
         else
@@ -195,7 +193,6 @@ sysctl -p /etc/sysctl.d/99-server-tuning.conf
 # --------------------------------------------------
 RECOMMENDED_NOFILE=65535
 
-# Get current limits from limits.conf (check hard limit for wildcard or root)
 CURRENT_NOFILE=$(grep -E '^\*\s+hard\s+nofile' /etc/security/limits.conf 2>/dev/null | awk '{print $4}' | tail -1)
 
 if [ -n "$CURRENT_NOFILE" ] && [ "$CURRENT_NOFILE" -gt 0 ] 2>/dev/null; then
@@ -205,7 +202,6 @@ if [ -n "$CURRENT_NOFILE" ] && [ "$CURRENT_NOFILE" -gt 0 ] 2>/dev/null; then
         info "Recommended:                                 ${RECOMMENDED_NOFILE}"
         if ask_yn "Change file descriptor limits to ${RECOMMENDED_NOFILE}?"; then
             log "Updating file descriptor limits..."
-            # Remove existing nofile entries
             sed -i '/^\*.*nofile/d' /etc/security/limits.conf
             sed -i '/^root.*nofile/d' /etc/security/limits.conf
             cat >> /etc/security/limits.conf << EOF
@@ -242,15 +238,27 @@ EOF
 systemctl restart systemd-journald
 
 # --------------------------------------------------
-# 8. AUTOMATIC SECURITY UPDATES
+# 8. AUTOMATIC SECURITY UPDATES (optional)
 # --------------------------------------------------
-log "Installing and configuring unattended-upgrades..."
-apt install -y unattended-upgrades
-cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+# Skipped for HestiaCP/Coolify — auto-updates can break
+# panel-managed packages and dependencies
+if [ "$HESTIA_RUNNING" = true ] || [ "$COOLIFY_RUNNING" = true ]; then
+    warn "Skipping unattended-upgrades (can break panel-managed packages)."
+    info "Manage updates manually or through your panel instead."
+else
+    echo ""
+    if ask_yn "Enable automatic security updates?"; then
+        log "Installing and configuring unattended-upgrades..."
+        apt install -y unattended-upgrades
+        cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+    else
+        log "Skipping unattended-upgrades."
+    fi
+fi
 
 # --------------------------------------------------
 # 9. ESSENTIAL PACKAGES
@@ -269,15 +277,19 @@ apt install -y \
     software-properties-common \
     ca-certificates \
     gnupg \
-    lsb-release \
-    fail2ban
+    lsb-release
 
 # --------------------------------------------------
-# 10. FAIL2BAN BASIC CONFIG
+# 10. FAIL2BAN (skip if HestiaCP — it manages its own)
 # --------------------------------------------------
-log "Configuring fail2ban..."
+if [ "$HESTIA_RUNNING" = true ]; then
+    warn "Skipping fail2ban setup (HestiaCP manages its own fail2ban configuration)."
+else
+    log "Installing and configuring fail2ban..."
+    apt install -y fail2ban
 
-FAIL2BAN_JAILS="[DEFAULT]
+    cat > /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
 bantime = 3600
 findtime = 600
 maxretry = 5
@@ -287,37 +299,37 @@ backend = systemd
 enabled = true
 port = ssh
 maxretry = 3
-bantime = 7200"
+bantime = 7200
+EOF
 
-# Add HestiaCP jail if Hestia is installed
-if [ "$HESTIA_RUNNING" = true ]; then
-    FAIL2BAN_JAILS="${FAIL2BAN_JAILS}
-
-[hestia]
-enabled = true
-filter = hestia
-logpath = /var/log/hestia/auth.log
-maxretry = 5
-bantime = 3600"
+    systemctl enable fail2ban
+    systemctl restart fail2ban
 fi
 
-echo "$FAIL2BAN_JAILS" > /etc/fail2ban/jail.local
-systemctl enable fail2ban
-systemctl restart fail2ban
-
 # --------------------------------------------------
-# 11. SSH HARDENING
+# 11. SSH HARDENING (skip if HestiaCP — it manages its own)
 # --------------------------------------------------
-log "Hardening SSH configuration..."
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+if [ "$HESTIA_RUNNING" = true ]; then
+    warn "Skipping SSH hardening (HestiaCP manages its own SSH configuration)."
+else
+    log "Hardening SSH configuration..."
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 5/' /etc/ssh/sshd_config
-sed -i 's/^#\?ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config
-sed -i 's/^#\?ClientAliveCountMax.*/ClientAliveCountMax 3/' /etc/ssh/sshd_config
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 5/' /etc/ssh/sshd_config
+    sed -i 's/^#\?ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config
+    sed -i 's/^#\?ClientAliveCountMax.*/ClientAliveCountMax 3/' /etc/ssh/sshd_config
 
-systemctl restart sshd
+    # Ubuntu 24.04 uses ssh.service, older versions use sshd.service
+    if systemctl list-units --type=service | grep -q 'ssh.service'; then
+        systemctl restart ssh
+    elif systemctl list-units --type=service | grep -q 'sshd.service'; then
+        systemctl restart sshd
+    else
+        warn "Could not determine SSH service name — restart SSH manually."
+    fi
+fi
 
 # --------------------------------------------------
 # 12. UFW FIREWALL (optional — skipped for Coolify/HestiaCP)
@@ -325,9 +337,9 @@ systemctl restart sshd
 UFW_INSTALLED=false
 
 if [ "$HESTIA_RUNNING" = true ]; then
-    warn "HestiaCP detected — skipping UFW (Hestia has its own iptables firewall)."
+    warn "Skipping UFW (HestiaCP has its own iptables firewall)."
 elif [ "$COOLIFY_RUNNING" = true ]; then
-    warn "Coolify detected — skipping UFW (Docker bypasses UFW rules)."
+    warn "Skipping UFW (Docker bypasses UFW rules)."
     info "Use your cloud provider's firewall or ufw-docker instead."
 else
     echo ""
@@ -358,7 +370,6 @@ for HOMEDIR in /root /home/*/; do
     if [ -d "${HOMEDIR}" ]; then
         BASHRC="${HOMEDIR}.bashrc"
         if [ -f "${BASHRC}" ]; then
-            # Remove any previous custom prompt we added
             sed -i '/# NodeHoldings custom prompt/d' "${BASHRC}"
         fi
         echo "${PROMPT_LINE}  # NodeHoldings custom prompt" >> "${BASHRC}"
@@ -390,13 +401,15 @@ echo "  Swap:           $(swapon --show --noheadings | awk '{print $3}' | head -
 echo "  Swappiness:     $(cat /proc/sys/vm/swappiness)"
 echo "  Cache Pressure: $(cat /proc/sys/vm/vfs_cache_pressure)"
 echo "  File Desc:      $(grep -E '^\*\s+hard\s+nofile' /etc/security/limits.conf | awk '{print $4}' | tail -1)"
-echo "  Fail2ban:       $(systemctl is-active fail2ban)"
-echo "  Auto-updates:   enabled"
 if [ "$HESTIA_RUNNING" = true ]; then
-echo "  HestiaCP:       detected (using built-in firewall, fail2ban jail added)"
+echo "  HestiaCP:       detected (using its own firewall, fail2ban, SSH config)"
 fi
 if [ "$COOLIFY_RUNNING" = true ]; then
 echo "  Coolify:        detected (use provider firewall or ufw-docker)"
+echo "  Fail2ban:       $(systemctl is-active fail2ban)"
+fi
+if [ "$HESTIA_RUNNING" = false ] && [ "$COOLIFY_RUNNING" = false ]; then
+echo "  Fail2ban:       $(systemctl is-active fail2ban)"
 fi
 if [ "$UFW_INSTALLED" = true ]; then
 echo "  UFW:            installed (NOT enabled — review rules first)"
