@@ -26,39 +26,31 @@ echo ""
 echo "--- FAIL2BAN RECOVERY ---"
 echo ""
 
-# Remove the broken jail.local we created
+# Remove the broken jail.local if it exists
 if [ -f /etc/fail2ban/jail.local ]; then
     warn "Removing overwritten /etc/fail2ban/jail.local..."
     rm /etc/fail2ban/jail.local
 fi
 
-# HestiaCP stores its fail2ban config in /etc/fail2ban/jail.local
-# but it also uses configs in /etc/fail2ban/jail.d/
-# Reinstall HestiaCP's fail2ban configuration
-if [ -d /usr/local/hestia ]; then
-    log "Regenerating HestiaCP fail2ban configuration..."
+# Restore from HestiaCP's install template
+HESTIA_JAIL_TEMPLATE="/usr/local/hestia/install/deb/fail2ban/jail.local"
 
-    # HestiaCP has a rebuild command that restores its fail2ban jails
-    /usr/local/hestia/bin/v-update-firewall
-
-    # Verify HestiaCP's fail2ban filters exist
-    if [ -d /etc/fail2ban/filter.d ]; then
-        HESTIA_FILTERS=$(ls /etc/fail2ban/filter.d/hestia* 2>/dev/null | wc -l)
-        if [ "$HESTIA_FILTERS" -gt 0 ]; then
-            log "Found ${HESTIA_FILTERS} HestiaCP fail2ban filters."
-        else
-            warn "No HestiaCP fail2ban filters found — they may need manual restoration."
-        fi
-    fi
+if [ -f "$HESTIA_JAIL_TEMPLATE" ]; then
+    log "Restoring jail.local from HestiaCP template..."
+    cp "$HESTIA_JAIL_TEMPLATE" /etc/fail2ban/jail.local
 else
-    err "HestiaCP not found at /usr/local/hestia — cannot auto-restore."
+    err "HestiaCP fail2ban template not found at ${HESTIA_JAIL_TEMPLATE}"
+    err "You may need to manually restore /etc/fail2ban/jail.local"
+    exit 1
 fi
 
-# Restart fail2ban
+# Restart fail2ban and wait for socket
 log "Restarting fail2ban..."
 systemctl restart fail2ban
-log "fail2ban status: $(systemctl is-active fail2ban)"
+sleep 3
 
+# Verify jails are loaded
+log "fail2ban status: $(systemctl is-active fail2ban)"
 echo ""
 echo "Current fail2ban jails:"
 fail2ban-client status
@@ -70,24 +62,46 @@ echo ""
 echo "--- SSH RECOVERY ---"
 echo ""
 
-# The SSH restart failed, so changes may not have applied.
-# But the backup was created, so restore it to be safe.
 if [ -f /etc/ssh/sshd_config.bak ]; then
     log "Restoring SSH config from backup..."
     cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
     rm /etc/ssh/sshd_config.bak
 
-    # Use correct service name for Ubuntu 24.04
+    # Ubuntu 24.04 uses ssh.service not sshd.service
     log "Restarting SSH service..."
-    systemctl restart ssh
-    log "SSH status: $(systemctl is-active ssh)"
+    if systemctl list-units --type=service | grep -q ' ssh.service'; then
+        systemctl restart ssh
+        log "SSH status: $(systemctl is-active ssh)"
+    elif systemctl list-units --type=service | grep -q 'sshd.service'; then
+        systemctl restart sshd
+        log "SSH status: $(systemctl is-active sshd)"
+    else
+        warn "Could not determine SSH service name — restart SSH manually."
+    fi
 else
     warn "No sshd_config.bak found — SSH config may not have been modified."
     warn "The restart failed earlier so changes likely didn't apply."
 fi
 
 # --------------------------------------------------
-# 3. VERIFY HESTIA SERVICES
+# 3. REMOVE UNATTENDED-UPGRADES IF INSTALLED
+# --------------------------------------------------
+echo ""
+echo "--- UNATTENDED-UPGRADES CHECK ---"
+echo ""
+
+if dpkg -l | grep -q unattended-upgrades; then
+    warn "unattended-upgrades is installed (can break HestiaCP packages)."
+    log "Removing unattended-upgrades..."
+    apt remove -y unattended-upgrades
+    rm -f /etc/apt/apt.conf.d/20auto-upgrades
+    log "unattended-upgrades removed."
+else
+    log "unattended-upgrades not installed, nothing to do."
+fi
+
+# --------------------------------------------------
+# 4. VERIFY HESTIA SERVICES
 # --------------------------------------------------
 echo ""
 echo "--- SERVICE VERIFICATION ---"
@@ -112,11 +126,11 @@ echo "  Recovery Complete"
 echo "============================================"
 echo ""
 echo "  What was fixed:"
-echo "    - Removed overwritten /etc/fail2ban/jail.local"
-echo "    - Regenerated HestiaCP fail2ban configuration"
-echo "    - Restored original SSH config from backup"
+echo "    - Restored /etc/fail2ban/jail.local from HestiaCP template"
+echo "    - Restored original SSH config from backup (if backup existed)"
+echo "    - Removed unattended-upgrades (if installed)"
 echo "    - Restarted fail2ban and SSH services"
 echo ""
-warn "Please verify your HestiaCP panel is accessible at https://vps.nodeholdings.com.au:8083"
+warn "Please verify your HestiaCP panel is accessible."
 warn "Check fail2ban jails above match what you expect."
 echo ""
